@@ -35,6 +35,8 @@ import AppSidebar from '@/layouts/AppSidebar';
 import { HttpUtil } from '@/utils';
 import { setMessageInstance } from '@/utils/messageBus';
 
+const JSON_HEADERS = { headers: { 'Content-Type': 'application/json' } } as const;
+
 interface ResellerRecord {
   id: number;
   username: string;
@@ -184,17 +186,21 @@ export default function ResellersPage() {
 
   const createMutation = useMutation({
     mutationFn: (v: FormValues) =>
-      HttpUtil.post<CreateResponse>('/panel/api/resellers/create', {
-        username: v.username,
-        password: v.password,
-        groupName: v.groupName,
-        allowedInboundIds: v.allowedInboundIds,
-        quotaBytes: Math.round(v.quotaGB * GB),
-      }),
+      HttpUtil.post<CreateResponse>(
+        '/panel/api/resellers/create',
+        {
+          username: v.username,
+          password: v.password,
+          groupName: v.groupName,
+          allowedInboundIds: v.allowedInboundIds,
+          quotaBytes: Math.round(v.quotaGB * GB),
+        },
+        JSON_HEADERS,
+      ),
   });
   const updateMutation = useMutation({
     mutationFn: ({ id, body }: { id: number; body: Record<string, unknown> }) =>
-      HttpUtil.post(`/panel/api/resellers/update/${id}`, body),
+      HttpUtil.post(`/panel/api/resellers/update/${id}`, body, JSON_HEADERS),
   });
   const regenMutation = useMutation({
     mutationFn: (id: number) =>
