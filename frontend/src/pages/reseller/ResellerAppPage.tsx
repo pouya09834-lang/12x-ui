@@ -3,6 +3,7 @@ import { useTranslation } from 'react-i18next';
 import {
   Button,
   ConfigProvider,
+  DatePicker,
   Form,
   Input,
   InputNumber,
@@ -28,8 +29,9 @@ import {
   SunOutlined,
 } from '@ant-design/icons';
 import type { ColumnsType } from 'antd/es/table';
+import dayjs from 'dayjs';
 
-import { FormProvider, useForm } from 'react-hook-form';
+import { FormProvider, useForm, useWatch } from 'react-hook-form';
 import { HttpUtil, SizeFormatter } from '@/utils';
 import { FormField } from '@/components/form/rhf';
 import { setMessageInstance } from '@/utils/messageBus';
@@ -38,6 +40,8 @@ import { pauseAnimationsUntilLeave, useTheme } from '@/hooks/useTheme';
 const basePath = window.X_UI_BASE_PATH || '';
 const ONE_GB = 1024 * 1024 * 1024;
 const ONE_DAY_MS = 24 * 60 * 60 * 1000;
+// The reseller API binds JSON bodies; HttpUtil defaults to form-encoding.
+const JSON_HEADERS = { 'Content-Type': 'application/json' };
 
 interface ResellerMe {
   username: string;
@@ -60,7 +64,7 @@ interface ResellerClient {
   enable: boolean;
   totalGB: number;
   expiryTime: number;
-  limitIp: number;
+  comment?: string;
   createdAt: number;
   traffic?: { up: number; down: number } | null;
 }
@@ -75,16 +79,20 @@ interface CreateClientForm {
   inboundId?: number;
   email: string;
   totalGB: number;
+  delayedStart: boolean;
   expiryDays: number;
-  limitIp: number;
+  expiryDate: number;
+  comment: string;
 }
 
 const emptyCreateForm: CreateClientForm = {
   inboundId: undefined,
   email: '',
   totalGB: 20,
+  delayedStart: false,
   expiryDays: 30,
-  limitIp: 0,
+  expiryDate: 0,
+  comment: '',
 };
 
 export default function ResellerAppPage() {
@@ -99,6 +107,8 @@ export default function ResellerAppPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
   const methods = useForm<CreateClientForm>({ defaultValues: emptyCreateForm });
+  const delayedStart = useWatch({ control: methods.control, name: 'delayedStart' });
+  const expiryDate = useWatch({ control: methods.control, name: 'expiryDate' });
 
   useEffect(() => setMessageInstance(messageApi), [messageApi]);
 
@@ -158,18 +168,32 @@ export default function ResellerAppPage() {
         messageApi.warning(t('pages.reseller.pickInbound'));
         return;
       }
+      if (!(values.totalGB > 0)) {
+        messageApi.warning(t('pages.clients.totalGB'));
+        return;
+      }
+      let expiryTime = 0;
+      if (values.delayedStart) {
+        expiryTime = values.expiryDays > 0 ? -values.expiryDays * ONE_DAY_MS : 0;
+      } else if (values.expiryDate > 0) {
+        expiryTime = values.expiryDate;
+      }
       setCreating(true);
       try {
-        const msg = await HttpUtil.post('/reseller/api/clients', {
-          inboundId: values.inboundId,
-          client: {
-            email: values.email,
-            totalGB: Math.round((values.totalGB || 0) * ONE_GB),
-            expiryTime: values.expiryDays > 0 ? Date.now() + values.expiryDays * ONE_DAY_MS : 0,
-            limitIp: values.limitIp || 0,
-            enable: true,
+        const msg = await HttpUtil.post(
+          '/reseller/api/clients',
+          {
+            inboundId: values.inboundId,
+            client: {
+              email: values.email.trim(),
+              totalGB: Math.round(values.totalGB * ONE_GB),
+              expiryTime,
+              comment: values.comment,
+              enable: true,
+            },
           },
-        });
+          { headers: JSON_HEADERS },
+        );
         if (msg.success) {
           setCreateOpen(false);
           await refresh();
@@ -241,8 +265,22 @@ export default function ResellerAppPage() {
         title: t('pages.clients.expiryTime'),
         dataIndex: 'expiryTime',
         key: 'expiryTime',
-        render: (v: number) =>
-          v > 0 ? new Date(v).toLocaleDateString() : <Tag>{t('pages.reseller.neverExpire')}</Tag>,
+        render: (v: number) => {
+          if (v < 0) {
+            return `${t('pages.clients.delayedStart')}: ${Math.round(v / -ONE_DAY_MS)}d`;
+          }
+          return v > 0 ? (
+            new Date(v).toLocaleDateString()
+          ) : (
+            <Tag>{t('pages.reseller.neverExpire')}</Tag>
+          );
+        },
+      },
+      {
+        title: t('pages.clients.comment'),
+        dataIndex: 'comment',
+        key: 'comment',
+        ellipsis: true,
       },
       {
         title: t('pages.clients.actions'),
@@ -357,21 +395,39 @@ export default function ResellerAppPage() {
               tooltip={t('pages.clients.totalGBDesc')}
               transform={{ output: (v) => Number(v) || 0 }}
             >
-              <InputNumber min={0} step={1} style={{ width: '100%' }} />
+              <InputNumber min={0.1} step={1} style={{ width: '100%' }} />
             </FormField>
-            <FormField
-              name="expiryDays"
-              label={t('pages.clients.renewDays')}
-              transform={{ output: (v) => Number(v) || 0 }}
-            >
-              <InputNumber min={0} style={{ width: '100%' }} />
-            </FormField>
-            <FormField
-              name="limitIp"
-              label={t('pages.clients.limitIp')}
-              transform={{ output: (v) => Number(v) || 0 }}
-            >
-              <InputNumber min={0} style={{ width: '100%' }} />
+            <Form.Item label={t('pages.clients.delayedStart')}>
+              <Switch
+                checked={delayedStart}
+                onChange={(v) => {
+                  methods.setValue('delayedStart', v);
+                  methods.setValue('expiryDate', 0);
+                }}
+              />
+            </Form.Item>
+            {delayedStart ? (
+              <FormField
+                name="expiryDays"
+                label={t('pages.clients.expireDays')}
+                transform={{ output: (v) => Number(v) || 0 }}
+              >
+                <InputNumber min={0} style={{ width: '100%' }} />
+              </FormField>
+            ) : (
+              <Form.Item label={t('pages.clients.expiryTime')}>
+                <DatePicker
+                  style={{ width: '100%' }}
+                  value={expiryDate > 0 ? dayjs(expiryDate) : null}
+                  disabledDate={(d) => d.endOf('day').valueOf() < Date.now()}
+                  onChange={(next) =>
+                    methods.setValue('expiryDate', next ? next.endOf('day').valueOf() : 0)
+                  }
+                />
+              </Form.Item>
+            )}
+            <FormField name="comment" label={t('pages.clients.comment')}>
+              <Input maxLength={200} />
             </FormField>
           </Form>
         </FormProvider>
