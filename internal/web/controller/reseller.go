@@ -290,6 +290,8 @@ func respondResellerAction(c *gin.Context, ok bool, err error) {
 		c.AbortWithStatus(http.StatusForbidden)
 	case errors.Is(err, service.ErrResellerQuotaExceeded):
 		pureJsonMsg(c, http.StatusOK, false, "traffic quota exceeded")
+	case errors.Is(err, service.ErrResellerTrafficRequired):
+		pureJsonMsg(c, http.StatusOK, false, "a traffic limit greater than 0 is required")
 	case err != nil:
 		jsonMsg(c, "operation failed", err)
 	default:
