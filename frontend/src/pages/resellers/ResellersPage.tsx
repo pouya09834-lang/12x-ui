@@ -44,6 +44,7 @@ interface ResellerRecord {
   allowedInboundIds: number[] | null;
   quotaBytes: number;
   usedBytes: number;
+  trafficRatio?: number;
   enabled: boolean;
   createdAt: number;
 }
@@ -59,6 +60,7 @@ interface FormValues {
   groupName?: string;
   allowedInboundIds: number[];
   quotaGB: number;
+  trafficRatio: number;
 }
 
 const GB = 1024 * 1024 * 1024;
@@ -75,6 +77,9 @@ const TEXT = {
     group: 'Client group',
     inbounds: 'Allowed inbounds',
     quota: 'Quota (GB)',
+    ratio: 'Traffic ratio',
+    ratioHint:
+      'Every client this reseller creates gets this usage multiplier (2 = counts double, 0.5 = counts half). Applies to new clients only.',
     used: 'Used',
     enabled: 'Enabled',
     actions: 'Actions',
@@ -111,6 +116,9 @@ const TEXT = {
     group: 'گروه کلاینت‌ها',
     inbounds: 'اینباندهای مجاز',
     quota: 'سهمیه (گیگابایت)',
+    ratio: 'ضریب مصرف',
+    ratioHint:
+      'هر کلاینتی که این ریسلر بسازد با این ضریب ثبت می‌شود (۲ = دو برابر حساب می‌شود، ۰.۵ = نصف). فقط روی کلاینت‌های جدید اعمال می‌شود.',
     used: 'مصرف‌شده',
     enabled: 'فعال',
     actions: 'عملیات',
@@ -194,6 +202,7 @@ export default function ResellersPage() {
           groupName: v.groupName,
           allowedInboundIds: v.allowedInboundIds,
           quotaBytes: Math.round(v.quotaGB * GB),
+          trafficRatio: v.trafficRatio || 1,
         },
         JSON_HEADERS,
       ),
@@ -213,7 +222,7 @@ export default function ResellersPage() {
   const openCreate = useCallback(() => {
     setEditing(null);
     form.resetFields();
-    form.setFieldsValue({ allowedInboundIds: [], quotaGB: 100 });
+    form.setFieldsValue({ allowedInboundIds: [], quotaGB: 100, trafficRatio: 1 });
     setFormOpen(true);
   }, [form]);
 
@@ -224,6 +233,7 @@ export default function ResellersPage() {
       form.setFieldsValue({
         allowedInboundIds: r.allowedInboundIds ?? [],
         quotaGB: Number((r.quotaBytes / GB).toFixed(2)),
+        trafficRatio: r.trafficRatio && r.trafficRatio > 0 ? r.trafficRatio : 1,
       });
       setFormOpen(true);
     },
@@ -236,6 +246,7 @@ export default function ResellersPage() {
       const body: Record<string, unknown> = {
         allowedInboundIds: v.allowedInboundIds,
         quotaBytes: Math.round(v.quotaGB * GB),
+        trafficRatio: v.trafficRatio || 1,
       };
       if (v.password) body.password = v.password;
       const msg = await updateMutation.mutateAsync({ id: editing.id, body });
@@ -335,6 +346,11 @@ export default function ResellersPage() {
       title: `${tx.used} / ${tx.quota}`,
       key: 'quota',
       render: (_, r) => `${formatBytes(r.usedBytes)} / ${formatBytes(r.quotaBytes)}`,
+    },
+    {
+      title: tx.ratio,
+      key: 'ratio',
+      render: (_, r) => `×${r.trafficRatio && r.trafficRatio > 0 ? r.trafficRatio : 1}`,
     },
     {
       title: tx.enabled,
@@ -484,6 +500,14 @@ export default function ResellersPage() {
               rules={[{ required: true, message: tx.required }]}
             >
               <InputNumber min={0} step={10} style={{ width: '100%' }} />
+            </Form.Item>
+            <Form.Item
+              name="trafficRatio"
+              label={tx.ratio}
+              extra={tx.ratioHint}
+              rules={[{ required: true, message: tx.required }]}
+            >
+              <InputNumber min={0.01} step={0.1} style={{ width: '100%' }} />
             </Form.Item>
           </Form>
         </Modal>
