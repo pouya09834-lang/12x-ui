@@ -983,8 +983,12 @@ type Reseller struct {
 	QuotaBytes int64 `json:"quotaBytes" gorm:"column:quota_bytes;default:0"`
 	UsedBytes  int64 `json:"usedBytes" gorm:"column:used_bytes;default:0"`
 	Enabled    bool  `json:"enabled" gorm:"default:true"`
-	CreatedAt  int64 `json:"createdAt" gorm:"autoCreateTime:milli"`
-	UpdatedAt  int64 `json:"updatedAt" gorm:"autoUpdateTime:milli"`
+	// TrafficRatio is the usage multiplier stamped onto every client this
+	// reseller creates (same field as the per-client "Traffic Ratio"). It is
+	// set by the admin only; the reseller can neither see nor change it.
+	TrafficRatio float64 `json:"trafficRatio" gorm:"column:traffic_ratio;default:1"`
+	CreatedAt    int64   `json:"createdAt" gorm:"autoCreateTime:milli"`
+	UpdatedAt    int64   `json:"updatedAt" gorm:"autoUpdateTime:milli"`
 }
 
 func (Reseller) TableName() string { return "resellers" }
