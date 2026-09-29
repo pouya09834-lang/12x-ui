@@ -11,6 +11,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
@@ -59,11 +60,20 @@ func generateResellerApiKey() (string, error) {
 
 // ResellerCreatePayload is the admin-supplied shape for creating a reseller.
 type ResellerCreatePayload struct {
-	Username          string `json:"username"`
-	Password          string `json:"password"`
-	GroupName         string `json:"groupName"`
-	AllowedInboundIds []int  `json:"allowedInboundIds"`
-	QuotaBytes        int64  `json:"quotaBytes"`
+	Username          string  `json:"username"`
+	Password          string  `json:"password"`
+	GroupName         string  `json:"groupName"`
+	AllowedInboundIds []int   `json:"allowedInboundIds"`
+	QuotaBytes        int64   `json:"quotaBytes"`
+	TrafficRatio      float64 `json:"trafficRatio"`
+}
+
+// normalizeRatio maps an unset/invalid ratio to the neutral 1.
+func normalizeRatio(v float64) float64 {
+	if v <= 0 {
+		return 1
+	}
+	return v
 }
 
 // Create adds a reseller and returns the plaintext API key. The key is never
@@ -91,6 +101,7 @@ func (s *ResellerService) Create(payload ResellerCreatePayload) (*model.Reseller
 		GroupName:         payload.GroupName,
 		AllowedInboundIds: payload.AllowedInboundIds,
 		QuotaBytes:        payload.QuotaBytes,
+		TrafficRatio:      normalizeRatio(payload.TrafficRatio),
 		Enabled:           true,
 	}
 	if err := database.GetDB().Create(r).Error; err != nil {
@@ -121,10 +132,11 @@ func (s *ResellerService) Get(id int) (*model.Reseller, error) {
 // changing either would silently orphan existing clients or break the
 // reseller's bot/login. Delete and recreate instead.
 type ResellerUpdatePayload struct {
-	Password          *string `json:"password"`
-	AllowedInboundIds *[]int  `json:"allowedInboundIds"`
-	QuotaBytes        *int64  `json:"quotaBytes"`
-	Enabled           *bool   `json:"enabled"`
+	Password          *string  `json:"password"`
+	AllowedInboundIds *[]int   `json:"allowedInboundIds"`
+	QuotaBytes        *int64   `json:"quotaBytes"`
+	Enabled           *bool    `json:"enabled"`
+	TrafficRatio      *float64 `json:"trafficRatio"`
 }
 
 // Update applies a partial edit. Loaded-then-saved (rather than a column-map
@@ -154,6 +166,9 @@ func (s *ResellerService) Update(id int, payload ResellerUpdatePayload) (*model.
 	}
 	if payload.Enabled != nil {
 		r.Enabled = *payload.Enabled
+	}
+	if payload.TrafficRatio != nil {
+		r.TrafficRatio = normalizeRatio(*payload.TrafficRatio)
 	}
 	if err := db.Save(&r).Error; err != nil {
 		return nil, err
@@ -245,59 +260,127 @@ func (s *ResellerService) ownClientOrForbidden(r *model.Reseller, email string) 
 	return rec, nil
 }
 
-// CreateClient creates a client on one of the reseller's allowed inbounds. It
-// forces the client onto the reseller's own group — whatever group the
-// request claims is ignored — and debits QuotaBytes by TotalGB inside a
-// row-locked transaction, so two near-simultaneous creates from the same
-// reseller cannot both slip under a nearly-exhausted quota. If the
-// downstream client creation then fails, the debit is reversed.
-func (s *ResellerService) CreateClient(inboundSvc *InboundService, r *model.Reseller, inboundId int, client model.Client) (bool, error) {
-	if !inboundAllowed(r, inboundId) {
-		return false, ErrResellerForbidden
+// debit charges amount bytes against the reseller's quota inside a
+// row-locked transaction, so two near-simultaneous requests cannot both slip
+// under a nearly-exhausted quota.
+func (s *ResellerService) debit(id int, amount int64) error {
+	if amount <= 0 {
+		return nil
 	}
-	if client.TotalGB < 0 {
-		client.TotalGB = 0
-	}
-	client.Group = r.GroupName
-
-	db := database.GetDB()
-	if err := db.Transaction(func(tx *gorm.DB) error {
+	return database.GetDB().Transaction(func(tx *gorm.DB) error {
 		var fresh model.Reseller
-		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&fresh, "id = ?", r.Id).Error; err != nil {
+		if err := tx.Clauses(clause.Locking{Strength: "UPDATE"}).First(&fresh, "id = ?", id).Error; err != nil {
 			return err
 		}
 		if !fresh.Enabled {
 			return ErrResellerForbidden
 		}
-		if fresh.UsedBytes+client.TotalGB > fresh.QuotaBytes {
+		if fresh.UsedBytes+amount > fresh.QuotaBytes {
 			return ErrResellerQuotaExceeded
 		}
 		return tx.Model(&model.Reseller{}).Where("id = ?", fresh.Id).
-			UpdateColumn("used_bytes", fresh.UsedBytes+client.TotalGB).Error
-	}); err != nil {
-		return false, err
+			UpdateColumn("used_bytes", fresh.UsedBytes+amount).Error
+	})
+}
+
+// credit gives amount bytes back to the reseller's quota (never below zero).
+func (s *ResellerService) credit(id int, amount int64) {
+	if amount <= 0 {
+		return
+	}
+	database.GetDB().Model(&model.Reseller{}).Where("id = ?", id).
+		UpdateColumn("used_bytes", gorm.Expr(database.GreatestExpr("used_bytes - ?", "0"), amount))
+}
+
+// ErrResellerTrafficRequired is returned when a reseller tries to create or
+// leave a client without a traffic limit: an unlimited client would consume
+// no quota at all, so it would bypass the volume ledger entirely.
+var ErrResellerTrafficRequired = errors.New("a traffic limit greater than 0 is required")
+
+const resellerMaxCommentRunes = 200
+
+func cleanComment(v string) string {
+	v = strings.TrimSpace(v)
+	if r := []rune(v); len(r) > resellerMaxCommentRunes {
+		v = string(r[:resellerMaxCommentRunes])
+	}
+	return v
+}
+
+// CreateClient creates a client on one of the reseller's allowed inbounds.
+//
+// The incoming model.Client is NOT trusted: only email, traffic limit, expiry
+// and comment are read from it. Everything else (group, traffic ratio, IP
+// limit, reset/renewal settings, reverse tag, sub id, credentials, ...) is
+// either forced from the reseller's own record or left to server defaults, so
+// a reseller cannot, for example, zero its own traffic ratio to hide usage.
+// The traffic limit is debited from the quota in a row-locked transaction; if
+// the downstream client creation fails, the debit is reversed.
+func (s *ResellerService) CreateClient(inboundSvc *InboundService, r *model.Reseller, inboundId int, in model.Client) (bool, error) {
+	if !inboundAllowed(r, inboundId) {
+		return false, ErrResellerForbidden
+	}
+	if in.TotalGB <= 0 {
+		return false, ErrResellerTrafficRequired
+	}
+	client := model.Client{
+		Email:        strings.TrimSpace(in.Email),
+		TotalGB:      in.TotalGB,
+		ExpiryTime:   in.ExpiryTime,
+		Comment:      cleanComment(in.Comment),
+		Enable:       true,
+		Group:        r.GroupName,
+		TrafficRatio: normalizeRatio(r.TrafficRatio),
 	}
 
+	if err := s.debit(r.Id, client.TotalGB); err != nil {
+		return false, err
+	}
 	created, err := s.clientService.CreateOne(inboundSvc, inboundId, client)
 	if err != nil || !created {
-		// The debit already landed; the create didn't. Give the volume back.
-		database.GetDB().Model(&model.Reseller{}).Where("id = ?", r.Id).
-			UpdateColumn("used_bytes", gorm.Expr("used_bytes - ?", client.TotalGB))
+		s.credit(r.Id, client.TotalGB)
 		return created, err
 	}
 	return true, nil
 }
 
-// UpdateClient edits one of the reseller's own clients. Group and inboundId
-// are not settable through this path — Group always stays the reseller's
-// own, and moving a client to a different inbound is an inbound-management
-// action the reseller doesn't have.
-func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Reseller, email string, updated model.Client, limitHwid int) (bool, error) {
-	if _, err := s.ownClientOrForbidden(r, email); err != nil {
+// UpdateClient edits one of the reseller's own clients. Only the traffic
+// limit, expiry and comment can change; everything else is taken from the
+// stored record. Raising the traffic limit is charged against the quota (the
+// difference), lowering it is never refunded, and the limit can never be
+// removed - otherwise editing would be a way around the quota.
+func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Reseller, email string, in model.Client, _ int) (bool, error) {
+	rec, err := s.ownClientOrForbidden(r, email)
+	if err != nil {
 		return false, err
 	}
+	updated := *rec.ToClient()
 	updated.Group = r.GroupName
-	return s.clientService.UpdateByEmail(inboundSvc, email, updated, limitHwid)
+
+	if in.TotalGB > 0 {
+		updated.TotalGB = in.TotalGB
+	}
+	if updated.TotalGB <= 0 {
+		return false, ErrResellerTrafficRequired
+	}
+	if in.ExpiryTime != 0 {
+		updated.ExpiryTime = in.ExpiryTime
+	}
+	if strings.TrimSpace(in.Comment) != "" {
+		updated.Comment = cleanComment(in.Comment)
+	}
+
+	extra := updated.TotalGB - rec.TotalGB
+	if extra > 0 {
+		if err := s.debit(r.Id, extra); err != nil {
+			return false, err
+		}
+	}
+	ok, err := s.clientService.UpdateByEmail(inboundSvc, email, updated, rec.LimitHwid)
+	if (err != nil || !ok) && extra > 0 {
+		s.credit(r.Id, extra)
+	}
+	return ok, err
 }
 
 // SetClientEnable toggles one of the reseller's own clients.
@@ -309,14 +392,23 @@ func (s *ResellerService) SetClientEnable(inboundSvc *InboundService, r *model.R
 	return ok, err
 }
 
-// ResetClientTraffic resets usage on one of the reseller's own clients. This
-// never touches the quota ledger — the ledger tracks sold volume, not
-// consumption.
+// ResetClientTraffic resets usage on one of the reseller's own clients. A
+// reset hands the customer a fresh allowance, so it is charged against the
+// quota exactly like selling that volume again (the client's traffic limit).
+// Without this a reseller could reset a client forever and never run out.
 func (s *ResellerService) ResetClientTraffic(inboundSvc *InboundService, r *model.Reseller, email string) (bool, error) {
-	if _, err := s.ownClientOrForbidden(r, email); err != nil {
+	rec, err := s.ownClientOrForbidden(r, email)
+	if err != nil {
 		return false, err
 	}
-	return s.clientService.ResetTrafficByEmail(inboundSvc, email)
+	if err := s.debit(r.Id, rec.TotalGB); err != nil {
+		return false, err
+	}
+	ok, err := s.clientService.ResetTrafficByEmail(inboundSvc, email)
+	if err != nil || !ok {
+		s.credit(r.Id, rec.TotalGB)
+	}
+	return ok, err
 }
 
 // DeleteClient deletes one of the reseller's own clients. Within
