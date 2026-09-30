@@ -46,7 +46,7 @@ export default function ResellerLoginPage() {
           <div className="login-wrapper">
             <div className="login-card">
               <div className="brand">
-                <span className="brand-name">3X-UI</span>
+                <span className="brand-name">12X-UI</span>
                 <span className="brand-accent" aria-hidden="true" />
               </div>
               <h2 className="welcome">
