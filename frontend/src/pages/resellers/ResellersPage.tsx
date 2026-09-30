@@ -27,6 +27,7 @@ import {
   KeyOutlined,
   PlusOutlined,
   ReloadOutlined,
+  SyncOutlined,
 } from '@ant-design/icons';
 
 import { useTheme } from '@/hooks/useTheme';
@@ -77,6 +78,8 @@ const TEXT = {
     group: 'Client group',
     inbounds: 'Allowed inbounds',
     quota: 'Quota (GB)',
+    recalc: 'Recalculate used volume',
+    recalcConfirm: 'Set the used volume to the total traffic limit of this reseller\'s existing clients?',
     ratio: 'Traffic ratio',
     ratioHint:
       'Every client this reseller creates gets this usage multiplier (2 = counts double, 0.5 = counts half). Applies to new clients only.',
@@ -116,6 +119,8 @@ const TEXT = {
     group: 'گروه کلاینت‌ها',
     inbounds: 'اینباندهای مجاز',
     quota: 'سهمیه (گیگابایت)',
+    recalc: 'محاسبه‌ی مجدد حجم مصرف‌شده',
+    recalcConfirm: 'حجم مصرف‌شده برابر مجموع حجم کلاینت‌های فعلی این ریسلر تنظیم شود؟',
     ratio: 'ضریب مصرف',
     ratioHint:
       'هر کلاینتی که این ریسلر بسازد با این ضریب ثبت می‌شود (۲ = دو برابر حساب می‌شود، ۰.۵ = نصف). فقط روی کلاینت‌های جدید اعمال می‌شود.',
@@ -215,6 +220,9 @@ export default function ResellersPage() {
     mutationFn: (id: number) =>
       HttpUtil.post<{ apiKey: string }>(`/panel/api/resellers/regenerateApiKey/${id}`),
   });
+  const recalcMutation = useMutation({
+    mutationFn: (id: number) => HttpUtil.post(`/panel/api/resellers/recalculateUsage/${id}`),
+  });
   const deleteMutation = useMutation({
     mutationFn: (id: number) => HttpUtil.post(`/panel/api/resellers/delete/${id}`),
   });
@@ -288,6 +296,22 @@ export default function ResellersPage() {
       });
     },
     [modal, tx, regenMutation],
+  );
+
+  const onRecalc = useCallback(
+    (r: ResellerRecord) => {
+      modal.confirm({
+        title: tx.recalc,
+        content: tx.recalcConfirm,
+        okText: tx.save,
+        cancelText: tx.cancel,
+        onOk: async () => {
+          const msg = await recalcMutation.mutateAsync(r.id);
+          if (msg?.success) await invalidate();
+        },
+      });
+    },
+    [modal, tx, recalcMutation, invalidate],
   );
 
   const onDelete = useCallback(
@@ -364,6 +388,7 @@ export default function ResellersPage() {
         <Space>
           <Button size="small" icon={<EditOutlined />} onClick={() => openEdit(r)} title={tx.edit} />
           <Button size="small" icon={<KeyOutlined />} onClick={() => onRegen(r)} title={tx.newKey} />
+          <Button size="small" icon={<SyncOutlined />} onClick={() => onRecalc(r)} title={tx.recalc} />
           <Button
             size="small"
             danger
