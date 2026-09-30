@@ -56,6 +56,8 @@ func (a *ResellerController) initRouter(g *gin.RouterGroup) {
 	api.GET("/clients", a.listClients)
 	api.POST("/clients", a.createClient)
 	api.PUT("/clients/:email", a.updateClient)
+	api.POST("/clients/:email/update", a.updateClient)
+	api.GET("/clients/:email/links", a.clientLinks)
 	api.POST("/clients/:email/enable", a.enableClient)
 	api.POST("/clients/:email/disable", a.disableClient)
 	api.POST("/clients/:email/resetTraffic", a.resetClientTraffic)
@@ -204,6 +206,7 @@ type resellerClientListParams struct {
 	Search   string `form:"search"`
 	Sort     string `form:"sort"`
 	Order    string `form:"order"`
+	Filter   string `form:"filter"`
 }
 
 func (a *ResellerController) listClients(c *gin.Context) {
@@ -214,7 +217,7 @@ func (a *ResellerController) listClients(c *gin.Context) {
 		return
 	}
 	resp, err := a.resellerService.ListClients(&a.inboundService, &a.settingService, r, service.ClientPageParams{
-		Page: p.Page, PageSize: p.PageSize, Search: p.Search, Sort: p.Sort, Order: p.Order,
+		Page: p.Page, PageSize: p.PageSize, Search: p.Search, Sort: p.Sort, Order: p.Order, Filter: p.Filter,
 	})
 	if err != nil {
 		jsonMsg(c, "failed to list clients", err)
@@ -241,9 +244,12 @@ func (a *ResellerController) createClient(c *gin.Context) {
 	respondResellerAction(c, ok, err)
 }
 
+// resellerUpdateClientRequest carries only what a reseller may edit. Any other
+// field a caller might add to the JSON body is simply not bound.
 type resellerUpdateClientRequest struct {
-	Client    model.Client `json:"client"`
-	LimitHwid int          `json:"limitHwid"`
+	TotalGB    *int64  `json:"totalGB"`
+	ExpiryTime *int64  `json:"expiryTime"`
+	Comment    *string `json:"comment"`
 }
 
 func (a *ResellerController) updateClient(c *gin.Context) {
@@ -254,8 +260,26 @@ func (a *ResellerController) updateClient(c *gin.Context) {
 		jsonMsg(c, "invalid request", err)
 		return
 	}
-	ok, err := a.resellerService.UpdateClient(&a.inboundService, r, email, req.Client, req.LimitHwid)
+	ok, err := a.resellerService.UpdateClient(&a.inboundService, r, email, service.ResellerClientEdit{
+		TotalGB: req.TotalGB, ExpiryTime: req.ExpiryTime, Comment: req.Comment,
+	})
 	respondResellerAction(c, ok, err)
+}
+
+// clientLinks returns the subscription URLs and config links of one of the
+// caller's own clients (ownership is checked in the service).
+func (a *ResellerController) clientLinks(c *gin.Context) {
+	r := middleware.CurrentReseller(c)
+	links, err := a.resellerService.ClientLinks(&a.inboundService, &a.settingService, r, resolveHost(c), c.Param("email"))
+	if err != nil {
+		if errors.Is(err, service.ErrResellerForbidden) {
+			c.AbortWithStatus(http.StatusForbidden)
+			return
+		}
+		jsonMsg(c, "failed to load links", err)
+		return
+	}
+	jsonObj(c, links, nil)
 }
 
 func (a *ResellerController) enableClient(c *gin.Context) {
@@ -290,6 +314,8 @@ func respondResellerAction(c *gin.Context, ok bool, err error) {
 		c.AbortWithStatus(http.StatusForbidden)
 	case errors.Is(err, service.ErrResellerQuotaExceeded):
 		pureJsonMsg(c, http.StatusOK, false, "traffic quota exceeded")
+	case errors.Is(err, service.ErrResellerLimitDecrease):
+		pureJsonMsg(c, http.StatusOK, false, "the traffic limit can only be increased")
 	case errors.Is(err, service.ErrResellerTrafficRequired):
 		pureJsonMsg(c, http.StatusOK, false, "a traffic limit greater than 0 is required")
 	case err != nil:

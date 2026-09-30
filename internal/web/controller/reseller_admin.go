@@ -29,6 +29,7 @@ func (a *ResellerAdminController) initRouter(g *gin.RouterGroup) {
 	g.POST("/create", a.create)
 	g.POST("/update/:id", a.update)
 	g.POST("/regenerateApiKey/:id", a.regenerateApiKey)
+	g.POST("/recalculateUsage/:id", a.recalculateUsage)
 	g.POST("/delete/:id", a.delete)
 }
 
@@ -41,6 +42,7 @@ type resellerView struct {
 	AllowedInboundIds []int  `json:"allowedInboundIds"`
 	QuotaBytes        int64  `json:"quotaBytes"`
 	UsedBytes         int64  `json:"usedBytes"`
+	TrafficRatio      float64 `json:"trafficRatio"`
 	Enabled           bool   `json:"enabled"`
 	CreatedAt         int64  `json:"createdAt"`
 }
@@ -53,6 +55,7 @@ func viewOfReseller(r *model.Reseller) resellerView {
 		AllowedInboundIds: r.AllowedInboundIds,
 		QuotaBytes:        r.QuotaBytes,
 		UsedBytes:         r.UsedBytes,
+		TrafficRatio:      r.TrafficRatio,
 		Enabled:           r.Enabled,
 		CreatedAt:         r.CreatedAt,
 	}
@@ -127,6 +130,22 @@ func (a *ResellerAdminController) regenerateApiKey(c *gin.Context) {
 		return
 	}
 	jsonObj(c, gin.H{"apiKey": apiKey}, nil)
+}
+
+// recalculateUsage rebuilds the reseller's used volume from the traffic limits
+// of the clients that currently exist in its group.
+func (a *ResellerAdminController) recalculateUsage(c *gin.Context) {
+	id, err := resellerIdParam(c)
+	if err != nil {
+		jsonMsg(c, "invalid id", err)
+		return
+	}
+	r, err := a.resellerService.RecalculateUsage(id)
+	if err != nil {
+		jsonMsg(c, "failed to recalculate usage", err)
+		return
+	}
+	jsonObj(c, viewOfReseller(r), nil)
 }
 
 func (a *ResellerAdminController) delete(c *gin.Context) {
