@@ -32,10 +32,12 @@ var ErrResellerForbidden = errors.New("not allowed for this reseller")
 var ErrResellerQuotaExceeded = errors.New("traffic quota exceeded")
 
 // resellerDeleteGraceMillis is the window, from a client's CreatedAt, within
-// which an unused client's totalGB is credited back to the reseller's quota
-// on delete. Past this window — or with any recorded up/down — the quota
-// charge is permanent, matching a real sale.
-const resellerDeleteGraceMillis = 30 * 60 * 1000
+// which a client that has never been online has its traffic limit credited
+// back to the reseller's quota when it is deleted (a mistake made at creation).
+// Past this window - or once the client has connected even once - the quota
+// charge is permanent, matching a real sale. Change this one constant to make
+// the window longer or shorter.
+const resellerDeleteGraceMillis = 10 * 60 * 1000
 
 type ResellerService struct {
 	clientService ClientService
@@ -297,6 +299,11 @@ func (s *ResellerService) credit(id int, amount int64) {
 // no quota at all, so it would bypass the volume ledger entirely.
 var ErrResellerTrafficRequired = errors.New("a traffic limit greater than 0 is required")
 
+// ErrResellerLimitDecrease is returned when an edit would lower a client's
+// traffic limit. Volume already sold is never refunded by editing, so the
+// limit can only go up (the difference is charged to the quota).
+var ErrResellerLimitDecrease = errors.New("the traffic limit can only be increased")
+
 const resellerMaxCommentRunes = 200
 
 func cleanComment(v string) string {
@@ -314,8 +321,11 @@ func cleanComment(v string) string {
 // limit, reset/renewal settings, reverse tag, sub id, credentials, ...) is
 // either forced from the reseller's own record or left to server defaults, so
 // a reseller cannot, for example, zero its own traffic ratio to hide usage.
-// The traffic limit is debited from the quota in a row-locked transaction; if
-// the downstream client creation fails, the debit is reversed.
+//
+// The traffic limit is debited from the quota BEFORE the client is created, in
+// a row-locked transaction. ClientService.CreateOne returns (needRestart,
+// error) - the bool is NOT "was created" - so success is judged by err alone;
+// on error the debit is reversed.
 func (s *ResellerService) CreateClient(inboundSvc *InboundService, r *model.Reseller, inboundId int, in model.Client) (bool, error) {
 	if !inboundAllowed(r, inboundId) {
 		return false, ErrResellerForbidden
@@ -336,20 +346,27 @@ func (s *ResellerService) CreateClient(inboundSvc *InboundService, r *model.Rese
 	if err := s.debit(r.Id, client.TotalGB); err != nil {
 		return false, err
 	}
-	created, err := s.clientService.CreateOne(inboundSvc, inboundId, client)
-	if err != nil || !created {
+	if _, err := s.clientService.CreateOne(inboundSvc, inboundId, client); err != nil {
 		s.credit(r.Id, client.TotalGB)
-		return created, err
+		return false, err
 	}
 	return true, nil
+}
+
+// ResellerClientEdit is the only part of a client a reseller may change. A nil
+// field means "leave as is".
+type ResellerClientEdit struct {
+	TotalGB    *int64
+	ExpiryTime *int64
+	Comment    *string
 }
 
 // UpdateClient edits one of the reseller's own clients. Only the traffic
 // limit, expiry and comment can change; everything else is taken from the
 // stored record. Raising the traffic limit is charged against the quota (the
-// difference), lowering it is never refunded, and the limit can never be
-// removed - otherwise editing would be a way around the quota.
-func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Reseller, email string, in model.Client, _ int) (bool, error) {
+// difference); lowering it is refused, and it can never be removed, so editing
+// is never a way around the quota.
+func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Reseller, email string, edit ResellerClientEdit) (bool, error) {
 	rec, err := s.ownClientOrForbidden(r, email)
 	if err != nil {
 		return false, err
@@ -357,17 +374,23 @@ func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Rese
 	updated := *rec.ToClient()
 	updated.Group = r.GroupName
 
-	if in.TotalGB > 0 {
-		updated.TotalGB = in.TotalGB
+	if edit.TotalGB != nil {
+		if *edit.TotalGB <= 0 {
+			return false, ErrResellerTrafficRequired
+		}
+		if *edit.TotalGB < rec.TotalGB {
+			return false, ErrResellerLimitDecrease
+		}
+		updated.TotalGB = *edit.TotalGB
 	}
 	if updated.TotalGB <= 0 {
 		return false, ErrResellerTrafficRequired
 	}
-	if in.ExpiryTime != 0 {
-		updated.ExpiryTime = in.ExpiryTime
+	if edit.ExpiryTime != nil {
+		updated.ExpiryTime = *edit.ExpiryTime
 	}
-	if strings.TrimSpace(in.Comment) != "" {
-		updated.Comment = cleanComment(in.Comment)
+	if edit.Comment != nil {
+		updated.Comment = cleanComment(*edit.Comment)
 	}
 
 	extra := updated.TotalGB - rec.TotalGB
@@ -376,11 +399,13 @@ func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Rese
 			return false, err
 		}
 	}
-	ok, err := s.clientService.UpdateByEmail(inboundSvc, email, updated, rec.LimitHwid)
-	if (err != nil || !ok) && extra > 0 {
-		s.credit(r.Id, extra)
+	if _, err := s.clientService.UpdateByEmail(inboundSvc, email, updated, rec.LimitHwid); err != nil {
+		if extra > 0 {
+			s.credit(r.Id, extra)
+		}
+		return false, err
 	}
-	return ok, err
+	return true, nil
 }
 
 // SetClientEnable toggles one of the reseller's own clients.
@@ -388,8 +413,10 @@ func (s *ResellerService) SetClientEnable(inboundSvc *InboundService, r *model.R
 	if _, err := s.ownClientOrForbidden(r, email); err != nil {
 		return false, err
 	}
-	_, ok, err := s.clientService.BulkSetEnable(inboundSvc, []string{email}, enable)
-	return ok, err
+	if _, _, err := s.clientService.BulkSetEnable(inboundSvc, []string{email}, enable); err != nil {
+		return false, err
+	}
+	return true, nil
 }
 
 // ResetClientTraffic resets usage on one of the reseller's own clients. A
@@ -404,45 +431,126 @@ func (s *ResellerService) ResetClientTraffic(inboundSvc *InboundService, r *mode
 	if err := s.debit(r.Id, rec.TotalGB); err != nil {
 		return false, err
 	}
-	ok, err := s.clientService.ResetTrafficByEmail(inboundSvc, email)
-	if err != nil || !ok {
+	if _, err := s.clientService.ResetTrafficByEmail(inboundSvc, email); err != nil {
 		s.credit(r.Id, rec.TotalGB)
+		return false, err
 	}
-	return ok, err
+	return true, nil
 }
 
 // DeleteClient deletes one of the reseller's own clients. Within
-// resellerDeleteGraceMillis of creation, and only if it never carried any
-// traffic, the client's TotalGB is credited back to QuotaBytes — an
-// unmistakable mis-click, not a used sale. Any later delete, or one with
-// recorded up/down, leaves the ledger exactly where it was.
+// resellerDeleteGraceMillis of creation, and only if the client never carried
+// traffic and has never been online (and is not online right now), its whole
+// traffic limit is credited back to the quota - an unmistakable mis-click, not
+// a used sale. Any later delete, or one after the client connected, leaves the
+// ledger exactly where it was.
 func (s *ResellerService) DeleteClient(inboundSvc *InboundService, r *model.Reseller, email string) (bool, error) {
 	rec, err := s.ownClientOrForbidden(r, email)
 	if err != nil {
 		return false, err
 	}
 
-	deleted, err := s.clientService.DeleteByEmail(inboundSvc, email, false)
-	if err != nil || !deleted {
-		return deleted, err
-	}
-
+	// Decide refund eligibility from the state BEFORE the delete removes the
+	// traffic row.
+	refund := false
 	age := time.Now().UnixMilli() - rec.CreatedAt
 	if age >= 0 && age <= resellerDeleteGraceMillis && rec.TotalGB > 0 {
 		var traffic xray.ClientTraffic
-		err := database.GetDB().Where("email = ?", email).First(&traffic).Error
-		if err == nil && traffic.Up == 0 && traffic.Down == 0 {
-			database.GetDB().Model(&model.Reseller{}).Where("id = ?", r.Id).
-				UpdateColumn("used_bytes", gorm.Expr(database.GreatestExpr("used_bytes - ?", "0"), rec.TotalGB))
+		terr := database.GetDB().Where("email = ?", email).First(&traffic).Error
+		neverUsed := terr == nil && traffic.Up == 0 && traffic.Down == 0 && traffic.LastOnline == 0
+		if terr != nil && errors.Is(terr, gorm.ErrRecordNotFound) {
+			neverUsed = true
 		}
+		if neverUsed {
+			refund = true
+			for _, online := range inboundSvc.GetOnlineClients() {
+				if online == email {
+					refund = false
+					break
+				}
+			}
+		}
+	}
+
+	if _, err := s.clientService.DeleteByEmail(inboundSvc, email, false); err != nil {
+		return false, err
+	}
+	if refund {
+		s.credit(r.Id, rec.TotalGB)
 	}
 	return true, nil
 }
 
-// ListParams mirrors the fields of the reseller's own ClientPageParams that
-// are safe to accept from the reseller (see controller): Group and Filter
-// are always overridden by the caller to the reseller's own group.
+// ListClients returns one page of the reseller's own clients, together with
+// dashboard counters that cover ONLY those clients.
 func (s *ResellerService) ListClients(inboundSvc *InboundService, settingSvc *SettingService, r *model.Reseller, params ClientPageParams) (*ClientPageResponse, error) {
-	params.Group = r.GroupName
-	return s.clientService.ListPaged(inboundSvc, settingSvc, params)
+	params.Group = ""
+	params.Protocol = ""
+	params.Inbound = ""
+	return s.clientService.ListPagedScoped(inboundSvc, settingSvc, params, r.GroupName)
+}
+
+// ResellerClientLinks is what the reseller's "client info" and QR dialogs show
+// for one of its own clients: the subscription URLs and the config links.
+type ResellerClientLinks struct {
+	SubId      string   `json:"subId"`
+	SubURL     string   `json:"subUrl"`
+	SubJSONURL string   `json:"subJsonUrl"`
+	Links      []string `json:"links"`
+}
+
+// ClientLinks resolves subscription and config links for one of the
+// reseller's own clients (the ownership check runs first).
+func (s *ResellerService) ClientLinks(inboundSvc *InboundService, settingSvc *SettingService, r *model.Reseller, host, email string) (*ResellerClientLinks, error) {
+	rec, err := s.ownClientOrForbidden(r, email)
+	if err != nil {
+		return nil, err
+	}
+	out := &ResellerClientLinks{SubId: rec.SubID, Links: []string{}}
+	if rec.SubID == "" {
+		return out, nil
+	}
+	if settings, sErr := settingSvc.GetDefaultSettings(host); sErr == nil {
+		if m, ok := settings.(map[string]any); ok {
+			if enabled, _ := m["subEnable"].(bool); enabled {
+				if uri, _ := m["subURI"].(string); uri != "" {
+					out.SubURL = uri + rec.SubID
+				}
+			}
+			if enabled, _ := m["subJsonEnable"].(bool); enabled {
+				if uri, _ := m["subJsonURI"].(string); uri != "" {
+					out.SubJSONURL = uri + rec.SubID
+				}
+			}
+		}
+	}
+	if links, lErr := inboundSvc.GetSubLinks(host, rec.SubID); lErr == nil && links != nil {
+		out.Links = links
+	}
+	return out, nil
+}
+
+// RecalculateUsage rebuilds a reseller's UsedBytes from the clients that
+// currently exist in its group (the sum of their traffic limits). Meant as a
+// one-off repair after the ledger was out of sync: clients that were already
+// deleted no longer count, so any earlier permanent charge for them is lost.
+func (s *ResellerService) RecalculateUsage(id int) (*model.Reseller, error) {
+	db := database.GetDB()
+	var r model.Reseller
+	if err := db.First(&r, "id = ?", id).Error; err != nil {
+		return nil, err
+	}
+	var sum int64
+	if err := db.Model(&model.ClientRecord{}).
+		Where("group_name = ?", r.GroupName).
+		Select("COALESCE(SUM(total_gb), 0)").
+		Scan(&sum).Error; err != nil {
+		return nil, err
+	}
+	if err := db.Model(&model.Reseller{}).Where("id = ?", r.Id).
+		UpdateColumn("used_bytes", sum).Error; err != nil {
+		return nil, err
+	}
+	r.UsedBytes = sum
+	return &r, nil
 }

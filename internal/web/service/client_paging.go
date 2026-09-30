@@ -8,6 +8,7 @@ import (
 
 	"github.com/mhsanaei/3x-ui/v3/internal/database"
 	"github.com/mhsanaei/3x-ui/v3/internal/database/model"
+	"github.com/mhsanaei/3x-ui/v3/internal/util/common"
 	"github.com/mhsanaei/3x-ui/v3/internal/xray"
 
 	"gorm.io/gorm"
@@ -127,6 +128,11 @@ const clientSearchCond = `(LOWER(c.email) LIKE ? ESCAPE '\'
 // memory cost ~200ms per request at 20k clients on a page that polls every
 // 5 seconds, which is what made the table feel stuck on large panels.
 type clientQuery struct {
+	// scopeGroup, when set, restricts EVERY statement built from this query -
+	// rows, counts, summary buckets and the online intersection - to clients
+	// whose group_name matches exactly. It is how a reseller gets its own
+	// dashboard without any figure or email leaking from other clients.
+	scopeGroup       string
 	db               *gorm.DB
 	joins            []clientQueryJoin
 	usedExpr         string
@@ -173,6 +179,9 @@ func (q clientQuery) from() *gorm.DB {
 	tx := q.db.Table("clients AS c")
 	for _, j := range q.joins {
 		tx = tx.Joins(j.sql, j.args...)
+	}
+	if q.scopeGroup != "" {
+		tx = tx.Where("c.group_name = ?", q.scopeGroup)
 	}
 	return tx
 }
@@ -334,6 +343,20 @@ func (q clientQuery) applyOrder(tx *gorm.DB, sortKey, order string) *gorm.DB {
 // page header needs. Every predicate runs in SQL, so the cost tracks the page
 // size rather than the number of clients on the panel.
 func (s *ClientService) ListPaged(inboundSvc *InboundService, settingSvc *SettingService, params ClientPageParams) (*ClientPageResponse, error) {
+	return s.listPaged(inboundSvc, settingSvc, params, "")
+}
+
+// ListPagedScoped is ListPaged restricted to one client group: totals, the
+// summary counters and their email lists, the online set and the rows all
+// cover only that group. The list of other group names is withheld.
+func (s *ClientService) ListPagedScoped(inboundSvc *InboundService, settingSvc *SettingService, params ClientPageParams, group string) (*ClientPageResponse, error) {
+	if group == "" {
+		return nil, common.NewError("group scope is required")
+	}
+	return s.listPaged(inboundSvc, settingSvc, params, group)
+}
+
+func (s *ClientService) listPaged(inboundSvc *InboundService, settingSvc *SettingService, params ClientPageParams, scopeGroup string) (*ClientPageResponse, error) {
 	db := database.GetDB()
 
 	pageSize := params.PageSize
@@ -360,9 +383,14 @@ func (s *ClientService) ListPaged(inboundSvc *InboundService, settingSvc *Settin
 
 	onlines := inboundSvc.GetOnlineClients()
 	q := newClientQuery(db, time.Now().UnixMilli(), expireDiffMs, trafficDiffBytes)
+	q.scopeGroup = scopeGroup
 
 	var total int64
-	if err := db.Model(&model.ClientRecord{}).Count(&total).Error; err != nil {
+	totalTx := db.Model(&model.ClientRecord{})
+	if scopeGroup != "" {
+		totalTx = totalTx.Where("group_name = ?", scopeGroup)
+	}
+	if err := totalTx.Count(&total).Error; err != nil {
 		return nil, err
 	}
 
@@ -387,9 +415,12 @@ func (s *ClientService) ListPaged(inboundSvc *InboundService, settingSvc *Settin
 		}
 	}
 
-	groups, err := s.listGroupNames()
-	if err != nil {
-		return nil, err
+	groups := []string{}
+	if scopeGroup == "" {
+		groups, err = s.listGroupNames()
+		if err != nil {
+			return nil, err
+		}
 	}
 
 	return &ClientPageResponse{
@@ -541,8 +572,12 @@ func (q clientQuery) onlineEmails(onlines []string) ([]string, int, error) {
 	count := 0
 	for _, batch := range chunkStrings(onlines, sqlInChunk) {
 		var page []string
-		if err := q.db.Model(&model.ClientRecord{}).
-			Where("COALESCE(enable, FALSE) = TRUE AND email IN ?", batch).
+		onlineTx := q.db.Model(&model.ClientRecord{}).
+			Where("COALESCE(enable, FALSE) = TRUE AND email IN ?", batch)
+		if q.scopeGroup != "" {
+			onlineTx = onlineTx.Where("group_name = ?", q.scopeGroup)
+		}
+		if err := onlineTx.
 			Order("id ASC").
 			Pluck("email", &page).Error; err != nil {
 			return nil, 0, err
