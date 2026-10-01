@@ -93,7 +93,7 @@ const TEXT = {
       'Delete this client? If it was created less than 10 minutes ago and never connected, its volume returns to your quota.',
     email: 'Email',
     inbound: 'Inbound',
-    pickInbound: 'Choose an inbound',
+    pickInbound: 'Choose one or more inbounds',
     limit: 'Traffic limit (GB)',
     limitEditHint: 'Can only be increased. The difference is charged to your quota.',
     delayed: 'Start After First Use',
@@ -155,7 +155,7 @@ const TEXT = {
       'این کلاینت حذف شود؟ اگر کمتر از ۱۰ دقیقه از ساختش گذشته و هیچ‌وقت وصل نشده باشد، حجمش به سهمیه‌ی شما برمی‌گردد.',
     email: 'ایمیل',
     inbound: 'اینباند',
-    pickInbound: 'یک اینباند انتخاب کنید',
+    pickInbound: 'یک یا چند اینباند انتخاب کنید',
     limit: 'حجم (گیگابایت)',
     limitEditHint: 'فقط قابل افزایش است و تفاوتش از سهمیه‌ی شما کم می‌شود.',
     delayed: 'شروع بعد از اولین استفاده',
@@ -235,7 +235,7 @@ interface ClientLinks {
 }
 
 interface AddValues {
-  inboundId?: number;
+  inboundIds: number[];
   email: string;
   totalGB: number;
   delayedStart: boolean;
@@ -387,7 +387,7 @@ export default function ResellerAppPage() {
   const openAdd = useCallback(() => {
     addForm.resetFields();
     addForm.setFieldsValue({
-      inboundId: inbounds[0]?.id,
+      inboundIds: inbounds.length === 1 ? [inbounds[0].id] : [],
       totalGB: 20,
       delayedStart: false,
       expiryDays: 30,
@@ -399,7 +399,7 @@ export default function ResellerAppPage() {
 
   const submitAdd = useCallback(async () => {
     const v = await addForm.validateFields();
-    if (!v.inboundId) {
+    if (!v.inboundIds || v.inboundIds.length === 0) {
       messageApi.warning(tx.pickInbound);
       return;
     }
@@ -408,7 +408,7 @@ export default function ResellerAppPage() {
       const msg = await HttpUtil.post(
         '/reseller/api/clients',
         {
-          inboundId: v.inboundId,
+          inboundIds: v.inboundIds,
           client: {
             email: v.email.trim(),
             totalGB: Math.round(v.totalGB * ONE_GB),
@@ -438,22 +438,28 @@ export default function ResellerAppPage() {
       editForm.resetFields();
       editForm.setFieldsValue({
         email: row.email,
+        inboundIds: (row.inboundIds ?? []).filter((id) => inbounds.some((ib) => ib.id === id)),
         totalGB: Number((row.totalGB / ONE_GB).toFixed(2)),
         comment: row.comment ?? '',
         ...expiryToForm(row.expiryTime),
       });
     },
-    [editForm],
+    [editForm, inbounds],
   );
 
   const submitEdit = useCallback(async () => {
     if (!editing) return;
     const v = await editForm.validateFields();
+    if (!v.inboundIds || v.inboundIds.length === 0) {
+      messageApi.warning(tx.pickInbound);
+      return;
+    }
     setSaving(true);
     try {
       const msg = await HttpUtil.post(
         `/reseller/api/clients/${encodeURIComponent(editing.email)}/update`,
         {
+          inboundIds: v.inboundIds,
           totalGB: Math.round(v.totalGB * ONE_GB),
           expiryTime: expiryFromForm(v),
           comment: v.comment ?? '',
@@ -467,7 +473,7 @@ export default function ResellerAppPage() {
     } finally {
       setSaving(false);
     }
-  }, [editForm, editing, load]);
+  }, [editForm, editing, load, messageApi, tx.pickInbound]);
 
   /* ------------------------------------------------------------- actions */
 
@@ -858,8 +864,10 @@ export default function ResellerAppPage() {
         destroyOnHidden
       >
         <Form form={addForm} layout="vertical">
-          <Form.Item name="inboundId" label={tx.inbound} rules={[{ required: true, message: tx.required }]}>
+          <Form.Item name="inboundIds" label={tx.inbound} rules={[{ required: true, message: tx.required }]}>
             <Select
+              mode="multiple"
+              allowClear
               placeholder={tx.pickInbound}
               options={inbounds.map((ib) => ({
                 value: ib.id,
@@ -893,6 +901,21 @@ export default function ResellerAppPage() {
         <Form form={editForm} layout="vertical">
           <Form.Item name="email" label={tx.email}>
             <Input disabled />
+          </Form.Item>
+          <Form.Item
+            name="inboundIds"
+            label={tx.inbound}
+            rules={[{ required: true, message: tx.required }]}
+          >
+            <Select
+              mode="multiple"
+              allowClear
+              placeholder={tx.pickInbound}
+              options={inbounds.map((ib) => ({
+                value: ib.id,
+                label: `${ib.remark} (${ib.protocol}:${ib.port})`,
+              }))}
+            />
           </Form.Item>
           <Form.Item
             name="totalGB"
