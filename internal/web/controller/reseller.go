@@ -229,7 +229,10 @@ func (a *ResellerController) listClients(c *gin.Context) {
 // resellerCreateClientRequest intentionally has no Group field: ownership is
 // never taken from the request body.
 type resellerCreateClientRequest struct {
-	InboundId  int    `json:"inboundId"`
+	// InboundIds is the list of inbounds to attach the client to. InboundId is
+	// the older single-inbound form, still accepted for bots written against it.
+	InboundIds []int        `json:"inboundIds"`
+	InboundId  int          `json:"inboundId"`
 	Client     model.Client `json:"client"`
 }
 
@@ -240,7 +243,11 @@ func (a *ResellerController) createClient(c *gin.Context) {
 		jsonMsg(c, "invalid request", err)
 		return
 	}
-	ok, err := a.resellerService.CreateClient(&a.inboundService, r, req.InboundId, req.Client)
+	ids := req.InboundIds
+	if len(ids) == 0 && req.InboundId > 0 {
+		ids = []int{req.InboundId}
+	}
+	ok, err := a.resellerService.CreateClient(&a.inboundService, r, ids, req.Client)
 	respondResellerAction(c, ok, err)
 }
 
@@ -250,6 +257,7 @@ type resellerUpdateClientRequest struct {
 	TotalGB    *int64  `json:"totalGB"`
 	ExpiryTime *int64  `json:"expiryTime"`
 	Comment    *string `json:"comment"`
+	InboundIds *[]int  `json:"inboundIds"`
 }
 
 func (a *ResellerController) updateClient(c *gin.Context) {
@@ -261,7 +269,7 @@ func (a *ResellerController) updateClient(c *gin.Context) {
 		return
 	}
 	ok, err := a.resellerService.UpdateClient(&a.inboundService, r, email, service.ResellerClientEdit{
-		TotalGB: req.TotalGB, ExpiryTime: req.ExpiryTime, Comment: req.Comment,
+		TotalGB: req.TotalGB, ExpiryTime: req.ExpiryTime, Comment: req.Comment, InboundIds: req.InboundIds,
 	})
 	respondResellerAction(c, ok, err)
 }
@@ -314,6 +322,8 @@ func respondResellerAction(c *gin.Context, ok bool, err error) {
 		c.AbortWithStatus(http.StatusForbidden)
 	case errors.Is(err, service.ErrResellerQuotaExceeded):
 		pureJsonMsg(c, http.StatusOK, false, "traffic quota exceeded")
+	case errors.Is(err, service.ErrResellerInboundRequired):
+		pureJsonMsg(c, http.StatusOK, false, "at least one inbound is required")
 	case errors.Is(err, service.ErrResellerLimitDecrease):
 		pureJsonMsg(c, http.StatusOK, false, "the traffic limit can only be increased")
 	case errors.Is(err, service.ErrResellerTrafficRequired):
