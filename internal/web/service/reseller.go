@@ -304,6 +304,10 @@ var ErrResellerTrafficRequired = errors.New("a traffic limit greater than 0 is r
 // limit can only go up (the difference is charged to the quota).
 var ErrResellerLimitDecrease = errors.New("the traffic limit can only be increased")
 
+// ErrResellerInboundRequired is returned when an edit would leave a client
+// with no inbound from the reseller's allow-list.
+var ErrResellerInboundRequired = errors.New("at least one inbound is required")
+
 const resellerMaxCommentRunes = 200
 
 func cleanComment(v string) string {
@@ -326,8 +330,22 @@ func cleanComment(v string) string {
 // a row-locked transaction. ClientService.CreateOne returns (needRestart,
 // error) - the bool is NOT "was created" - so success is judged by err alone;
 // on error the debit is reversed.
-func (s *ResellerService) CreateClient(inboundSvc *InboundService, r *model.Reseller, inboundId int, in model.Client) (bool, error) {
-	if !inboundAllowed(r, inboundId) {
+func (s *ResellerService) CreateClient(inboundSvc *InboundService, r *model.Reseller, inboundIds []int, in model.Client) (bool, error) {
+	// Every requested inbound must be on the reseller's allow-list; one
+	// disallowed id rejects the whole request. Duplicates are dropped.
+	ids := make([]int, 0, len(inboundIds))
+	seen := make(map[int]struct{}, len(inboundIds))
+	for _, id := range inboundIds {
+		if _, dup := seen[id]; dup {
+			continue
+		}
+		if !inboundAllowed(r, id) {
+			return false, ErrResellerForbidden
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
 		return false, ErrResellerForbidden
 	}
 	if in.TotalGB <= 0 {
@@ -346,7 +364,12 @@ func (s *ResellerService) CreateClient(inboundSvc *InboundService, r *model.Rese
 	if err := s.debit(r.Id, client.TotalGB); err != nil {
 		return false, err
 	}
-	if _, err := s.clientService.CreateOne(inboundSvc, inboundId, client); err != nil {
+	// One client record shared by all chosen inbounds: the traffic limit is
+	// debited once, not once per inbound.
+	if _, err := s.clientService.Create(inboundSvc, &ClientCreatePayload{
+		Client:     client,
+		InboundIds: ids,
+	}); err != nil {
 		s.credit(r.Id, client.TotalGB)
 		return false, err
 	}
@@ -359,6 +382,10 @@ type ResellerClientEdit struct {
 	TotalGB    *int64
 	ExpiryTime *int64
 	Comment    *string
+	// InboundIds, when set, is the complete list of the reseller's ALLOWED
+	// inbounds the client should be attached to. Inbounds outside the
+	// reseller's allow-list are neither shown nor touched.
+	InboundIds *[]int
 }
 
 // UpdateClient edits one of the reseller's own clients. Only the traffic
@@ -393,6 +420,41 @@ func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Rese
 		updated.Comment = cleanComment(*edit.Comment)
 	}
 
+	// Validate the requested inbound set before anything is charged.
+	var attach, detach []int
+	if edit.InboundIds != nil {
+		current, err := s.clientService.GetInboundIdsForRecord(rec.Id)
+		if err != nil {
+			return false, err
+		}
+		have := make(map[int]struct{}, len(current))
+		for _, id := range current {
+			have[id] = struct{}{}
+		}
+		want := make(map[int]struct{}, len(*edit.InboundIds))
+		for _, id := range *edit.InboundIds {
+			if !inboundAllowed(r, id) {
+				return false, ErrResellerForbidden
+			}
+			want[id] = struct{}{}
+		}
+		if len(want) == 0 {
+			return false, ErrResellerInboundRequired
+		}
+		for id := range want {
+			if _, ok := have[id]; !ok {
+				attach = append(attach, id)
+			}
+		}
+		for _, id := range current {
+			// Only inbounds the reseller is allowed to manage can be detached;
+			// anything else the admin attached stays exactly as it is.
+			if _, keep := want[id]; !keep && inboundAllowed(r, id) {
+				detach = append(detach, id)
+			}
+		}
+	}
+
 	extra := updated.TotalGB - rec.TotalGB
 	if extra > 0 {
 		if err := s.debit(r.Id, extra); err != nil {
@@ -404,6 +466,17 @@ func (s *ResellerService) UpdateClient(inboundSvc *InboundService, r *model.Rese
 			s.credit(r.Id, extra)
 		}
 		return false, err
+	}
+	// Attach first so the client is never left without an inbound.
+	if len(attach) > 0 {
+		if _, err := s.clientService.AttachByEmail(inboundSvc, email, attach); err != nil {
+			return false, err
+		}
+	}
+	if len(detach) > 0 {
+		if _, err := s.clientService.DetachByEmailMany(inboundSvc, email, detach); err != nil {
+			return false, err
+		}
 	}
 	return true, nil
 }
@@ -487,7 +560,21 @@ func (s *ResellerService) ListClients(inboundSvc *InboundService, settingSvc *Se
 	params.Group = ""
 	params.Protocol = ""
 	params.Inbound = ""
-	return s.clientService.ListPagedScoped(inboundSvc, settingSvc, params, r.GroupName)
+	resp, err := s.clientService.ListPagedScoped(inboundSvc, settingSvc, params, r.GroupName)
+	if err != nil {
+		return nil, err
+	}
+	// A reseller only ever learns about inbounds it is allowed to use.
+	for i := range resp.Items {
+		kept := make([]int, 0, len(resp.Items[i].InboundIds))
+		for _, id := range resp.Items[i].InboundIds {
+			if inboundAllowed(r, id) {
+				kept = append(kept, id)
+			}
+		}
+		resp.Items[i].InboundIds = kept
+	}
+	return resp, nil
 }
 
 // ResellerClientLinks is what the reseller's "client info" and QR dialogs show
